@@ -7,6 +7,8 @@ struct ReminderSyncSummary: Equatable {
     var updated: Int = 0
     var unchanged: Int = 0
     var deletedFromReminders: Int = 0
+    var clearedOldDailyNotes: Int = 0
+    var skippedOldDailyNotes: Int = 0
     var skippedDeleted: Int = 0
     var failed: Int = 0
     var failureMessages: [String] = []
@@ -20,13 +22,32 @@ struct ReminderSyncSummary: Equatable {
         ]
 
         if skippedDeleted > 0 {
-            parts.append("\(skippedDeleted) deleted in Reminders skipped")
+            parts.append("\(skippedDeleted) excluded from sync")
         }
         if deletedFromReminders > 0 {
             parts.append("\(deletedFromReminders) deleted from Reminders")
         }
+        if clearedOldDailyNotes > 0 {
+            parts.append("\(clearedOldDailyNotes) old daily cleared")
+        }
+        if skippedOldDailyNotes > 0 {
+            parts.append("\(skippedOldDailyNotes) old daily skipped")
+        }
 
         return parts.joined(separator: ", ")
+    }
+
+    mutating func merge(_ other: ReminderSyncSummary) {
+        created += other.created
+        updated += other.updated
+        unchanged += other.unchanged
+        deletedFromReminders += other.deletedFromReminders
+        clearedOldDailyNotes += other.clearedOldDailyNotes
+        skippedOldDailyNotes += other.skippedOldDailyNotes
+        skippedDeleted += other.skippedDeleted
+        failed += other.failed
+        failureMessages.append(contentsOf: other.failureMessages)
+        syncedTaskIDs.formUnion(other.syncedTaskIDs)
     }
 }
 

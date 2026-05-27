@@ -94,6 +94,7 @@ struct ObsidianTaskParser {
                 title: cleanedTitle(from: rawBody),
                 isCompleted: String(line[statusRange]).lowercased() == "x",
                 dueDate: dueDate(in: rawBody) ?? dailyNoteDate,
+                dailyNoteDate: dailyNoteDate,
                 source: source,
                 fileURL: fileURL,
                 relativePath: relativePath,

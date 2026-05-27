@@ -11,12 +11,30 @@ struct ContentView: View {
 
             Divider()
 
-            Table(viewModel.tasks) {
+            Table(viewModel.visibleTasks) {
                 TableColumn("Status") { task in
                     Image(systemName: task.isCompleted ? "checkmark.circle.fill" : "circle")
                         .foregroundStyle(task.isCompleted ? .green : .secondary)
                 }
                 .width(56)
+
+                TableColumn("Sync") { task in
+                    Button {
+                        Task {
+                            await viewModel.toggleSyncExclusion(for: task)
+                        }
+                    } label: {
+                        Label(
+                            viewModel.syncStatusLabel(for: task),
+                            systemImage: viewModel.syncStatusSystemImage(for: task)
+                        )
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(viewModel.isTaskExcludedFromSync(task) ? .orange : .secondary)
+                    .help(viewModel.syncStatusHelp(for: task))
+                    .disabled(viewModel.isWorking)
+                }
+                .width(120)
 
                 TableColumn("Task", value: \.title)
 
@@ -31,7 +49,7 @@ struct ContentView: View {
                     .width(120)
             }
             .overlay {
-                if viewModel.tasks.isEmpty {
+                if viewModel.visibleTasks.isEmpty {
                     ContentUnavailableView(
                         "No Tasks",
                         systemImage: "checklist",
@@ -39,6 +57,7 @@ struct ContentView: View {
                     )
                 }
             }
+            .frame(maxHeight: .infinity)
 
             Divider()
 
@@ -48,7 +67,7 @@ struct ContentView: View {
     }
 
     private var toolbar: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top, spacing: 12) {
                 sourcePicker(
                     title: "Daily Notes",
@@ -60,42 +79,86 @@ struct ContentView: View {
 
                 taskFilesPicker
             }
+            .fixedSize(horizontal: false, vertical: true)
 
-            HStack(spacing: 12) {
-                Label("Reminders: \(viewModel.remindersStatus)", systemImage: "bell.badge")
-                    .foregroundStyle(.secondary)
-
-                TextField("List", text: $viewModel.reminderListName)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 180)
-
-                Toggle(isOn: $viewModel.isContinuousSyncEnabled) {
-                    Label("Auto", systemImage: "clock.arrow.2.circlepath")
-                }
-                .toggleStyle(.switch)
-
-                Spacer()
-
-                Button {
-                    viewModel.scanNow()
-                } label: {
-                    Label("Rescan", systemImage: "arrow.clockwise")
-                }
-                .disabled(viewModel.isWorking)
-
-                Button {
-                    Task {
-                        await viewModel.syncNow()
-                    }
-                } label: {
-                    Label("Sync", systemImage: "arrow.triangle.2.circlepath")
-                }
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut("s", modifiers: .command)
-                .disabled(!viewModel.canSync)
-            }
+            syncControlsRow
         }
-        .padding(16)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var syncControlsRow: some View {
+        HStack(spacing: 14) {
+            HStack(spacing: 6) {
+                Image(systemName: "bell.badge")
+                Text("Access: \(viewModel.remindersStatus)")
+            }
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+
+            Divider()
+                .frame(height: 22)
+
+            defaultListField
+
+            Toggle(isOn: $viewModel.isContinuousSyncEnabled) {
+                Label("Auto", systemImage: "clock.arrow.2.circlepath")
+            }
+            .toggleStyle(.switch)
+            .fixedSize()
+
+            Toggle(isOn: $viewModel.clearsOldDailyNotes) {
+                Label("Skip Old Daily", systemImage: "calendar.badge.clock")
+            }
+            .toggleStyle(.switch)
+            .help("Do not sync older daily notes; yesterday clears after 8 AM.")
+            .fixedSize()
+
+            Toggle(isOn: $viewModel.hidesCompletedTasks) {
+                Label("Hide Done", systemImage: "checkmark.circle")
+            }
+            .toggleStyle(.switch)
+            .fixedSize()
+
+            Spacer(minLength: 12)
+
+            Button {
+                viewModel.scanNow()
+            } label: {
+                Label("Rescan", systemImage: "arrow.clockwise")
+            }
+            .disabled(viewModel.isWorking)
+
+            Button {
+                Task {
+                    await viewModel.syncNow()
+                }
+            } label: {
+                Label("Sync", systemImage: "arrow.triangle.2.circlepath")
+            }
+            .buttonStyle(.borderedProminent)
+            .keyboardShortcut("s", modifiers: .command)
+            .disabled(!viewModel.canSync)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var defaultListField: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("Default list")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+
+            TextField("Obsidian", text: $viewModel.reminderListName)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 180)
+        }
+        .frame(width: 180, alignment: .leading)
+        .fixedSize(horizontal: true, vertical: true)
+        .help("Default Reminders list for daily notes and task files without an override")
     }
 
     private var statusBar: some View {
@@ -147,6 +210,17 @@ struct ContentView: View {
                 Text(viewModel.taskFilesLabel)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                if !viewModel.taskFileSelections.isEmpty {
+                    Button {
+                        viewModel.applyTaskFileReminderListChanges()
+                    } label: {
+                        Label("Apply Lists", systemImage: "checkmark.circle")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(!viewModel.hasPendingTaskFileReminderListChanges || viewModel.isWorking)
+                    .help("Apply file list changes to sync")
+                }
             }
 
             if viewModel.taskFileSelections.isEmpty {
@@ -168,6 +242,36 @@ struct ContentView: View {
                                 .lineLimit(1)
                                 .truncationMode(.middle)
 
+                            Text("List")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+
+                            TextField(
+                                "List",
+                                text: Binding(
+                                    get: {
+                                        selection.draftReminderListName
+                                    },
+                                    set: { newValue in
+                                        viewModel.setDraftReminderListName(newValue, for: selection)
+                                    }
+                                )
+                            )
+                            .textFieldStyle(.roundedBorder)
+                            .font(.caption)
+                            .frame(width: 150)
+                            .help("Reminder list for this task file; changes apply after pressing Apply Lists")
+
+                            if selection.hasPendingReminderListChange {
+                                Image(systemName: "circle.fill")
+                                    .font(.system(size: 7, weight: .semibold))
+                                    .foregroundStyle(.orange)
+                                    .help("Pending list change")
+                            } else {
+                                Color.clear
+                                    .frame(width: 7, height: 7)
+                            }
+
                             Button {
                                 viewModel.removeTaskFile(selection)
                             } label: {
@@ -183,6 +287,7 @@ struct ContentView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     private func sourcePicker(
@@ -213,6 +318,7 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     private func chooseDailyNotesFolder() {

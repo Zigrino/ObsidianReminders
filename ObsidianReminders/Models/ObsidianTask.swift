@@ -19,6 +19,7 @@ struct ObsidianTask: Identifiable, Hashable {
     let title: String
     let isCompleted: Bool
     let dueDate: Date?
+    let dailyNoteDate: Date?
     let source: Source
     let fileURL: URL
     let relativePath: String

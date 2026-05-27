@@ -3,6 +3,9 @@ import Foundation
 
 struct TaskFileSelection: Identifiable, Hashable {
     let url: URL
+    let reminderListName: String
+    let draftReminderListName: String
+    let hasPendingReminderListChange: Bool
 
     var id: String {
         url.standardizedFileURL.path
@@ -21,6 +24,8 @@ struct TaskFileSelection: Identifiable, Hashable {
 final class SyncViewModel: ObservableObject {
     @Published private(set) var dailyNotesFolderURL: URL?
     @Published private(set) var taskFileURLs: [URL] = []
+    @Published private var taskFileReminderListNamesByPath: [String: String] = [:]
+    @Published private var taskFileReminderListNameDraftsByPath: [String: String] = [:]
     @Published var reminderListName: String {
         didSet {
             defaults.set(reminderListName, forKey: DefaultsKey.reminderListName)
@@ -30,6 +35,18 @@ final class SyncViewModel: ObservableObject {
         didSet {
             defaults.set(isContinuousSyncEnabled, forKey: DefaultsKey.continuousSyncEnabled)
             configureContinuousSync(runImmediately: isContinuousSyncEnabled)
+        }
+    }
+    @Published var clearsOldDailyNotes: Bool {
+        didSet {
+            defaults.set(clearsOldDailyNotes, forKey: DefaultsKey.clearsOldDailyNotes)
+            scanNow()
+            kickContinuousSyncIfNeeded()
+        }
+    }
+    @Published var hidesCompletedTasks: Bool {
+        didSet {
+            defaults.set(hidesCompletedTasks, forKey: DefaultsKey.hidesCompletedTasks)
         }
     }
     @Published private(set) var tasks: [ObsidianTask] = []
@@ -43,10 +60,15 @@ final class SyncViewModel: ObservableObject {
         static let dailyNotesFolderBookmark = "dailyNotesFolderBookmark"
         static let todoFileBookmark = "todoFileBookmark"
         static let taskFileBookmarks = "taskFileBookmarks"
+        static let taskFileReminderListNamesByPath = "taskFileReminderListNamesByPath"
         static let reminderListName = "reminderListName"
+        static let knownReminderListNames = "knownReminderListNames"
         static let continuousSyncEnabled = "continuousSyncEnabled"
+        static let clearsOldDailyNotes = "clearsOldDailyNotes"
+        static let hidesCompletedTasks = "hidesCompletedTasks"
         static let syncedReminderTaskIDs = "syncedReminderTaskIDs"
         static let deletedReminderTaskTitlesByID = "deletedReminderTaskTitlesByID"
+        static let manuallyExcludedReminderTaskTitlesByID = "manuallyExcludedReminderTaskTitlesByID"
     }
 
     private enum SyncTrigger {
@@ -60,10 +82,16 @@ final class SyncViewModel: ObservableObject {
         let deletedTaskIDs: Set<String>
     }
 
+    private struct OldDailyTaskFilterResult {
+        let tasksToSync: [ObsidianTask]
+        let skippedTasks: [ObsidianTask]
+    }
+
     private let defaults: UserDefaults
     private let parser = ObsidianTaskParser()
     private let completionWriter = ObsidianTaskCompletionWriter()
     private let reminderSyncService = ReminderSyncService()
+    private let calendar = Calendar.current
     private static let continuousSyncIntervalNanoseconds: UInt64 = 60 * 1_000_000_000
     private static let continuousSyncTimeFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -79,6 +107,9 @@ final class SyncViewModel: ObservableObject {
         self.defaults = defaults
         self.reminderListName = defaults.string(forKey: DefaultsKey.reminderListName) ?? "Obsidian"
         self.isContinuousSyncEnabled = defaults.object(forKey: DefaultsKey.continuousSyncEnabled) as? Bool ?? true
+        self.clearsOldDailyNotes = defaults.object(forKey: DefaultsKey.clearsOldDailyNotes) as? Bool ?? false
+        self.hidesCompletedTasks = defaults.object(forKey: DefaultsKey.hidesCompletedTasks) as? Bool ?? false
+        self.taskFileReminderListNamesByPath = defaults.dictionary(forKey: DefaultsKey.taskFileReminderListNamesByPath) as? [String: String] ?? [:]
         restoreBookmarks()
         refreshRemindersStatus()
         scanNow()
@@ -98,7 +129,31 @@ final class SyncViewModel: ObservableObject {
     }
 
     var taskFileSelections: [TaskFileSelection] {
-        taskFileURLs.map(TaskFileSelection.init)
+        taskFileURLs.map { url in
+            let reminderListName = reminderListName(forTaskFile: url)
+            let draftReminderListName = draftReminderListName(forTaskFile: url)
+            return TaskFileSelection(
+                url: url,
+                reminderListName: reminderListName,
+                draftReminderListName: draftReminderListName,
+                hasPendingReminderListChange: draftReminderListName != reminderListName
+            )
+        }
+    }
+
+    var visibleTasks: [ObsidianTask] {
+        hidesCompletedTasks ? tasks.filter { !$0.isCompleted } : tasks
+    }
+
+    var hasPendingTaskFileReminderListChanges: Bool {
+        taskFileURLs.contains { url in
+            let path = url.standardizedFileURL.path
+            guard let draftReminderListName = taskFileReminderListNameDraftsByPath[path] else {
+                return false
+            }
+
+            return draftReminderListName != reminderListName(forTaskFile: url)
+        }
     }
 
     var canSync: Bool {
@@ -145,6 +200,9 @@ final class SyncViewModel: ObservableObject {
         let updatedURLs = taskFileURLs.filter { $0.standardizedFileURL.path != selection.id }
         do {
             try saveTaskFileBookmarks(for: updatedURLs)
+            taskFileReminderListNamesByPath.removeValue(forKey: selection.id)
+            taskFileReminderListNameDraftsByPath.removeValue(forKey: selection.id)
+            saveTaskFileReminderListNames()
             taskFileURLs = updatedURLs
             scanNow()
             updateContinuousSyncStatus()
@@ -156,9 +214,58 @@ final class SyncViewModel: ObservableObject {
     func clearTaskFiles() {
         defaults.removeObject(forKey: DefaultsKey.todoFileBookmark)
         defaults.removeObject(forKey: DefaultsKey.taskFileBookmarks)
+        defaults.removeObject(forKey: DefaultsKey.taskFileReminderListNamesByPath)
+        taskFileReminderListNamesByPath = [:]
+        taskFileReminderListNameDraftsByPath = [:]
         taskFileURLs = []
         scanNow()
         updateContinuousSyncStatus()
+    }
+
+    func setDraftReminderListName(_ listName: String, for selection: TaskFileSelection) {
+        if listName == reminderListName(forTaskFile: selection.url) {
+            taskFileReminderListNameDraftsByPath.removeValue(forKey: selection.id)
+        } else {
+            taskFileReminderListNameDraftsByPath[selection.id] = listName
+        }
+    }
+
+    func applyTaskFileReminderListChanges() {
+        guard hasPendingTaskFileReminderListChanges else {
+            taskFileReminderListNameDraftsByPath = [:]
+            return
+        }
+
+        let defaultListName = sanitizedReminderListName
+        var changedEffectiveList = false
+
+        for taskFileURL in taskFileURLs {
+            let path = taskFileURL.standardizedFileURL.path
+            guard let draftReminderListName = taskFileReminderListNameDraftsByPath[path] else {
+                continue
+            }
+
+            let previousReminderListName = reminderListName(forTaskFile: taskFileURL)
+            let nextReminderListName = sanitizedListName(draftReminderListName)
+            changedEffectiveList = changedEffectiveList || nextReminderListName != previousReminderListName
+
+            if nextReminderListName == defaultListName {
+                taskFileReminderListNamesByPath.removeValue(forKey: path)
+            } else {
+                taskFileReminderListNamesByPath[path] = nextReminderListName
+            }
+        }
+
+        taskFileReminderListNameDraftsByPath = [:]
+        saveTaskFileReminderListNames()
+        scanNow()
+        statusMessage = changedEffectiveList ? "Applied task file list changes." : "No task file list changes to apply."
+
+        if changedEffectiveList {
+            kickContinuousSyncIfNeeded()
+        } else {
+            updateContinuousSyncStatus()
+        }
     }
 
     func scanNow() {
@@ -170,9 +277,15 @@ final class SyncViewModel: ObservableObject {
         }
 
         do {
-            tasks = try loadTasks()
+            let loadedTasks = try loadTasks()
+            let oldDailyFilter = filterOldDailyTasks(loadedTasks)
+            tasks = oldDailyFilter.tasksToSync
             lastSummary = nil
-            statusMessage = "\(tasks.count) Obsidian tasks found."
+            if oldDailyFilter.skippedTasks.isEmpty {
+                statusMessage = "\(tasks.count) Obsidian tasks found."
+            } else {
+                statusMessage = "\(tasks.count) active Obsidian tasks found, \(oldDailyFilter.skippedTasks.count) old daily skipped."
+            }
         } catch {
             tasks = []
             statusMessage = error.localizedDescription
@@ -183,6 +296,66 @@ final class SyncViewModel: ObservableObject {
 
     func syncNow() async {
         await performSync(trigger: .manual)
+    }
+
+    func syncStatusLabel(for task: ObsidianTask) -> String {
+        isTaskExcludedFromSync(task) ? "Excluded" : "Included"
+    }
+
+    func syncStatusSystemImage(for task: ObsidianTask) -> String {
+        isTaskExcludedFromSync(task) ? "nosign" : "arrow.triangle.2.circlepath"
+    }
+
+    func syncStatusHelp(for task: ObsidianTask) -> String {
+        isTaskExcludedFromSync(task)
+            ? "Include this task in future syncs"
+            : "Exclude this task and remove its Reminder"
+    }
+
+    func isTaskExcludedFromSync(_ task: ObsidianTask) -> Bool {
+        excludedTaskTitle(for: task) == task.title
+    }
+
+    func toggleSyncExclusion(for task: ObsidianTask) async {
+        let listName = reminderListName(for: task)
+        let postScanStatusMessage: String
+
+        if isTaskExcludedFromSync(task) {
+            var manuallyExcludedTaskTitlesByID = storedManuallyExcludedReminderTaskTitlesByID(in: listName)
+            manuallyExcludedTaskTitlesByID.removeValue(forKey: task.id)
+            saveManuallyExcludedReminderTaskTitlesByID(manuallyExcludedTaskTitlesByID, in: listName)
+
+            var deletedTaskTitlesByID = storedDeletedReminderTaskTitlesByID(in: listName)
+            deletedTaskTitlesByID.removeValue(forKey: task.id)
+            saveDeletedReminderTaskTitlesByID(deletedTaskTitlesByID, in: listName)
+            postScanStatusMessage = "Included in sync; it will be recreated in Reminders on the next sync."
+        } else {
+            do {
+                let deletedTaskIDs = try await reminderSyncService.deleteReminders(
+                    taskIDs: [task.id],
+                    listName: listName
+                )
+                var deletedTaskTitlesByID = storedDeletedReminderTaskTitlesByID(in: listName)
+                deletedTaskTitlesByID[task.id] = task.title
+                saveDeletedReminderTaskTitlesByID(deletedTaskTitlesByID, in: listName)
+
+                var manuallyExcludedTaskTitlesByID = storedManuallyExcludedReminderTaskTitlesByID(in: listName)
+                manuallyExcludedTaskTitlesByID.removeValue(forKey: task.id)
+                saveManuallyExcludedReminderTaskTitlesByID(manuallyExcludedTaskTitlesByID, in: listName)
+
+                postScanStatusMessage = deletedTaskIDs.isEmpty
+                    ? "Excluded from sync; no matching Reminder was found to remove."
+                    : "Excluded from sync and removed from Reminders."
+            } catch {
+                statusMessage = error.localizedDescription
+                updateContinuousSyncStatus()
+                return
+            }
+        }
+
+        scanNow()
+        statusMessage = postScanStatusMessage
+        kickContinuousSyncIfNeeded()
     }
 
     private func performSync(trigger: SyncTrigger) async {
@@ -206,41 +379,85 @@ final class SyncViewModel: ObservableObject {
 
         do {
             let loadedTasks = try loadTasks()
-            let snapshotResult = try await reminderSyncService.taskSnapshotResult(
-                inListNamed: sanitizedReminderListName
+            let initialOldDailyFilter = filterOldDailyTasks(loadedTasks)
+            var listNames = reminderListNames(for: loadedTasks)
+            listNames.formUnion(selectedSourceReminderListNames())
+            listNames.formUnion(storedKnownReminderListNames())
+            var snapshotResults = try await taskSnapshotResults(for: listNames)
+            let writeCandidateTasks = initialOldDailyFilter.tasksToSync.filter {
+                !isTaskExcludedFromSync($0)
+            }
+            let reminderSnapshots = routedReminderSnapshots(
+                from: snapshotResults,
+                tasks: writeCandidateTasks
             )
             let writeSummary = try writeReminderChangesToObsidian(
-                tasks: loadedTasks,
-                reminderSnapshots: snapshotResult.snapshots
+                tasks: writeCandidateTasks,
+                reminderSnapshots: reminderSnapshots
             )
             let tasksToSync = writeSummary.total > 0 ? try loadTasks() : loadedTasks
-            tasks = tasksToSync
-            let obsidianDeletedTaskIDs = taskIDsDeletedFromObsidian(
-                tasks: tasksToSync,
-                reminderSnapshots: snapshotResult.snapshots,
-                reminderListExists: snapshotResult.listExists
-            )
-            let deletedFromRemindersTaskIDs = try await reminderSyncService.deleteReminders(
-                taskIDs: obsidianDeletedTaskIDs,
-                listName: sanitizedReminderListName
-            )
-            let deletionFilter = filterTasksDeletedFromReminders(
-                tasks: tasksToSync,
-                reminderSnapshots: snapshotResult.snapshots,
-                reminderListExists: snapshotResult.listExists
-            )
+            let oldDailyFilter = filterOldDailyTasks(tasksToSync)
+            tasks = oldDailyFilter.tasksToSync
 
-            var summary = try await reminderSyncService.sync(
-                tasks: deletionFilter.tasksToSync,
-                listName: sanitizedReminderListName
-            )
-            summary.skippedDeleted = deletionFilter.skippedCount
-            summary.deletedFromReminders = deletedFromRemindersTaskIDs.count
-            rememberSyncedReminderTaskIDs(
-                summary.syncedTaskIDs,
-                currentTaskIDs: Set(tasksToSync.map(\.id)),
-                deletedTaskIDs: deletionFilter.deletedTaskIDs
-            )
+            listNames.formUnion(reminderListNames(for: tasksToSync))
+            listNames.formUnion(selectedSourceReminderListNames())
+            listNames.formUnion(storedKnownReminderListNames())
+            snapshotResults = try await taskSnapshotResults(for: listNames)
+
+            var summary = ReminderSyncSummary()
+            for listName in listNames.sorted() {
+                let snapshotResult = snapshotResults[listName] ?? ReminderTaskSnapshotResult(
+                    listExists: false,
+                    snapshots: [:]
+                )
+                let allTasksForList = tasksToSync.filter { reminderListName(for: $0) == listName }
+                let activeTasksForList = oldDailyFilter.tasksToSync.filter { reminderListName(for: $0) == listName }
+                let oldDailyTasksForList = oldDailyFilter.skippedTasks.filter { reminderListName(for: $0) == listName }
+                let clearedOldDailyTaskIDs = try await reminderSyncService.deleteReminders(
+                    taskIDs: Set(oldDailyTasksForList.map(\.id)),
+                    listName: listName
+                )
+                let obsidianDeletedTaskIDs = taskIDsDeletedFromObsidian(
+                    tasks: allTasksForList,
+                    reminderSnapshots: snapshotResult.snapshots,
+                    reminderListExists: snapshotResult.listExists,
+                    listName: listName
+                )
+                let deletedFromRemindersTaskIDs = try await reminderSyncService.deleteReminders(
+                    taskIDs: obsidianDeletedTaskIDs,
+                    listName: listName
+                )
+                let exclusionFilter = filterTasksExcludedFromSync(
+                    trackedTasks: allTasksForList,
+                    syncCandidateTasks: activeTasksForList,
+                    reminderSnapshots: snapshotResult.snapshots,
+                    reminderListExists: snapshotResult.listExists,
+                    listName: listName
+                )
+
+                var listSummary = ReminderSyncSummary()
+                if snapshotResult.listExists || !exclusionFilter.tasksToSync.isEmpty {
+                    listSummary = try await reminderSyncService.sync(
+                        tasks: exclusionFilter.tasksToSync,
+                        listName: listName
+                    )
+                }
+                listSummary.skippedDeleted = exclusionFilter.skippedCount
+                listSummary.deletedFromReminders = deletedFromRemindersTaskIDs.count
+                listSummary.clearedOldDailyNotes = clearedOldDailyTaskIDs.count
+                listSummary.skippedOldDailyNotes = oldDailyTasksForList.count
+                rememberSyncedReminderTaskIDs(
+                    listSummary.syncedTaskIDs,
+                    currentTaskIDs: Set(activeTasksForList.map(\.id)),
+                    deletedTaskIDs: exclusionFilter.deletedTaskIDs
+                        .union(deletedFromRemindersTaskIDs)
+                        .union(clearedOldDailyTaskIDs),
+                    listName: listName
+                )
+                summary.merge(listSummary)
+            }
+            saveKnownReminderListNames(retainedReminderListNames(from: listNames, currentTasks: tasksToSync))
+
             lastSummary = summary
             let pulledPrefix = statusPrefix(for: writeSummary)
             let messagePrefix = trigger == .continuous ? "Auto sync complete" : "Sync complete"
@@ -332,20 +549,21 @@ final class SyncViewModel: ObservableObject {
     private func taskIDsDeletedFromObsidian(
         tasks: [ObsidianTask],
         reminderSnapshots: [String: ReminderTaskSnapshot],
-        reminderListExists: Bool
+        reminderListExists: Bool,
+        listName: String
     ) -> Set<String> {
         guard reminderListExists else { return [] }
 
         let currentTaskIDs = Set(tasks.map(\.id))
         let reminderTaskIDs = Set(reminderSnapshots.keys)
 
-        return selectedSourceSyncedTaskIDs()
+        return selectedSourceSyncedTaskIDs(in: listName)
             .subtracting(currentTaskIDs)
             .intersection(reminderTaskIDs)
     }
 
-    private func selectedSourceSyncedTaskIDs() -> Set<String> {
-        Set(storedSyncedReminderTaskIDs().filter { taskID in
+    private func selectedSourceSyncedTaskIDs(in listName: String) -> Set<String> {
+        Set(storedSyncedReminderTaskIDs(in: listName).filter { taskID in
             isSourceSelected(forTaskID: taskID)
         })
     }
@@ -368,18 +586,147 @@ final class SyncViewModel: ObservableObject {
         }
     }
 
-    private func filterTasksDeletedFromReminders(
-        tasks: [ObsidianTask],
+    private func filterOldDailyTasks(_ tasks: [ObsidianTask]) -> OldDailyTaskFilterResult {
+        guard clearsOldDailyNotes else {
+            return OldDailyTaskFilterResult(tasksToSync: tasks, skippedTasks: [])
+        }
+
+        let now = Date()
+        let skippedTasks = tasks.filter { isOldDailyTask($0, now: now) }
+        let skippedTaskIDs = Set(skippedTasks.map(\.id))
+        let tasksToSync = tasks.filter { !skippedTaskIDs.contains($0.id) }
+
+        return OldDailyTaskFilterResult(tasksToSync: tasksToSync, skippedTasks: skippedTasks)
+    }
+
+    private func isOldDailyTask(_ task: ObsidianTask, now: Date) -> Bool {
+        guard task.source == .dailyNote, let dailyNoteDate = task.dailyNoteDate else {
+            return false
+        }
+
+        let todayStart = calendar.startOfDay(for: now)
+        guard let yesterdayStart = calendar.date(byAdding: .day, value: -1, to: todayStart) else {
+            return false
+        }
+
+        let noteDay = calendar.startOfDay(for: dailyNoteDate)
+        if noteDay < yesterdayStart {
+            return true
+        }
+
+        guard calendar.isDate(noteDay, inSameDayAs: yesterdayStart) else {
+            return false
+        }
+
+        var cutoffComponents = calendar.dateComponents([.year, .month, .day], from: todayStart)
+        cutoffComponents.hour = 8
+        cutoffComponents.minute = 0
+        cutoffComponents.second = 0
+        let yesterdayClearCutoff = calendar.date(from: cutoffComponents) ?? todayStart
+
+        return now >= yesterdayClearCutoff
+    }
+
+    private func reminderListNames(for tasks: [ObsidianTask]) -> Set<String> {
+        Set(tasks.map { reminderListName(for: $0) })
+    }
+
+    private func selectedSourceReminderListNames() -> Set<String> {
+        var listNames: Set<String> = []
+
+        if dailyNotesFolderURL != nil {
+            listNames.insert(sanitizedReminderListName)
+        }
+
+        for taskFileURL in taskFileURLs {
+            listNames.insert(reminderListName(forTaskFile: taskFileURL))
+        }
+
+        return listNames
+    }
+
+    private func reminderListName(for task: ObsidianTask) -> String {
+        switch task.source {
+        case .dailyNote:
+            return sanitizedReminderListName
+        case .todoFile:
+            return reminderListName(forTaskFile: task.fileURL)
+        }
+    }
+
+    private func reminderListName(forTaskFile url: URL) -> String {
+        let path = url.standardizedFileURL.path
+        guard let listName = taskFileReminderListNamesByPath[path] else {
+            return sanitizedReminderListName
+        }
+
+        return sanitizedListName(listName)
+    }
+
+    private func draftReminderListName(forTaskFile url: URL) -> String {
+        let path = url.standardizedFileURL.path
+        return taskFileReminderListNameDraftsByPath[path] ?? reminderListName(forTaskFile: url)
+    }
+
+    private func taskSnapshotResults(
+        for listNames: Set<String>
+    ) async throws -> [String: ReminderTaskSnapshotResult] {
+        var results: [String: ReminderTaskSnapshotResult] = [:]
+        for listName in listNames {
+            results[listName] = try await reminderSyncService.taskSnapshotResult(inListNamed: listName)
+        }
+
+        return results
+    }
+
+    private func routedReminderSnapshots(
+        from results: [String: ReminderTaskSnapshotResult],
+        tasks: [ObsidianTask]
+    ) -> [String: ReminderTaskSnapshot] {
+        tasks.reduce(into: [:]) { partialResult, task in
+            let listName = reminderListName(for: task)
+            if let snapshot = results[listName]?.snapshots[task.id] {
+                partialResult[task.id] = snapshot
+            }
+        }
+    }
+
+    private func retainedReminderListNames(
+        from listNames: Set<String>,
+        currentTasks: [ObsidianTask]
+    ) -> Set<String> {
+        var retainedListNames = selectedSourceReminderListNames()
+        retainedListNames.formUnion(reminderListNames(for: currentTasks))
+
+        for listName in listNames {
+            if !storedSyncedReminderTaskIDs(in: listName).isEmpty
+                || !storedDeletedReminderTaskTitlesByID(in: listName).isEmpty
+                || !storedManuallyExcludedReminderTaskTitlesByID(in: listName).isEmpty {
+                retainedListNames.insert(listName)
+            }
+        }
+
+        return retainedListNames
+    }
+
+    private func filterTasksExcludedFromSync(
+        trackedTasks: [ObsidianTask],
+        syncCandidateTasks: [ObsidianTask],
         reminderSnapshots: [String: ReminderTaskSnapshot],
-        reminderListExists: Bool
+        reminderListExists: Bool,
+        listName: String
     ) -> DeletedReminderFilterResult {
-        let tasksByID = tasks.reduce(into: [String: ObsidianTask]()) { partialResult, task in
+        let tasksByID = trackedTasks.reduce(into: [String: ObsidianTask]()) { partialResult, task in
             partialResult[task.id] = task
         }
         let currentTaskIDs = Set(tasksByID.keys)
+        let syncCandidateTaskIDs = Set(syncCandidateTasks.map(\.id))
         let reminderTaskIDs = Set(reminderSnapshots.keys)
-        let knownSyncedTaskIDs = storedSyncedReminderTaskIDs().intersection(currentTaskIDs)
-        var deletedTaskTitlesByID = storedDeletedReminderTaskTitlesByID().filter { taskID, title in
+        let knownSyncedTaskIDs = storedSyncedReminderTaskIDs(in: listName).intersection(currentTaskIDs)
+        let manuallyExcludedTaskTitlesByID = storedManuallyExcludedReminderTaskTitlesByID(in: listName).filter { taskID, title in
+            tasksByID[taskID]?.title == title
+        }
+        var deletedTaskTitlesByID = storedDeletedReminderTaskTitlesByID(in: listName).filter { taskID, title in
             tasksByID[taskID]?.title == title
         }
 
@@ -395,16 +742,23 @@ final class SyncViewModel: ObservableObject {
             }
         }
 
-        saveDeletedReminderTaskTitlesByID(deletedTaskTitlesByID)
+        saveDeletedReminderTaskTitlesByID(deletedTaskTitlesByID, in: listName)
+        saveManuallyExcludedReminderTaskTitlesByID(manuallyExcludedTaskTitlesByID, in: listName)
 
-        let tasksToSync = tasks.filter { task in
-            deletedTaskTitlesByID[task.id] != task.title
+        let excludedTaskTitlesByID = manuallyExcludedTaskTitlesByID.merging(deletedTaskTitlesByID) { manual, _ in
+            manual
         }
-        let deletedTaskIDs = Set(deletedTaskTitlesByID.keys).intersection(currentTaskIDs)
+
+        let tasksToSync = syncCandidateTasks.filter { task in
+            excludedTaskTitlesByID[task.id] != task.title
+        }
+        let deletedTaskIDs = Set(deletedTaskTitlesByID.keys)
+            .intersection(currentTaskIDs)
+            .intersection(syncCandidateTaskIDs)
 
         return DeletedReminderFilterResult(
             tasksToSync: tasksToSync,
-            skippedCount: tasks.count - tasksToSync.count,
+            skippedCount: syncCandidateTasks.count - tasksToSync.count,
             deletedTaskIDs: deletedTaskIDs
         )
     }
@@ -412,38 +766,97 @@ final class SyncViewModel: ObservableObject {
     private func rememberSyncedReminderTaskIDs(
         _ taskIDs: Set<String>,
         currentTaskIDs: Set<String>,
-        deletedTaskIDs: Set<String>
+        deletedTaskIDs: Set<String>,
+        listName: String
     ) {
-        var knownTaskIDs = storedSyncedReminderTaskIDs()
+        var knownTaskIDs = storedSyncedReminderTaskIDs(in: listName)
         knownTaskIDs.formUnion(taskIDs)
         knownTaskIDs.formIntersection(currentTaskIDs)
         knownTaskIDs.subtract(deletedTaskIDs)
-        saveSyncedReminderTaskIDs(knownTaskIDs)
+        saveSyncedReminderTaskIDs(knownTaskIDs, in: listName)
     }
 
-    private func storedSyncedReminderTaskIDs() -> Set<String> {
-        Set(defaults.stringArray(forKey: listScopedDefaultsKey(DefaultsKey.syncedReminderTaskIDs)) ?? [])
+    private func storedSyncedReminderTaskIDs(in listName: String) -> Set<String> {
+        Set(defaults.stringArray(forKey: listScopedDefaultsKey(DefaultsKey.syncedReminderTaskIDs, listName: listName)) ?? [])
     }
 
-    private func saveSyncedReminderTaskIDs(_ taskIDs: Set<String>) {
-        defaults.set(taskIDs.sorted(), forKey: listScopedDefaultsKey(DefaultsKey.syncedReminderTaskIDs))
+    private func saveSyncedReminderTaskIDs(_ taskIDs: Set<String>, in listName: String) {
+        defaults.set(taskIDs.sorted(), forKey: listScopedDefaultsKey(DefaultsKey.syncedReminderTaskIDs, listName: listName))
     }
 
-    private func storedDeletedReminderTaskTitlesByID() -> [String: String] {
-        defaults.dictionary(forKey: listScopedDefaultsKey(DefaultsKey.deletedReminderTaskTitlesByID)) as? [String: String] ?? [:]
+    private func storedDeletedReminderTaskTitlesByID(in listName: String) -> [String: String] {
+        defaults.dictionary(forKey: listScopedDefaultsKey(DefaultsKey.deletedReminderTaskTitlesByID, listName: listName)) as? [String: String] ?? [:]
     }
 
-    private func saveDeletedReminderTaskTitlesByID(_ taskTitlesByID: [String: String]) {
-        defaults.set(taskTitlesByID, forKey: listScopedDefaultsKey(DefaultsKey.deletedReminderTaskTitlesByID))
+    private func saveDeletedReminderTaskTitlesByID(_ taskTitlesByID: [String: String], in listName: String) {
+        saveTaskTitlesByID(taskTitlesByID, key: DefaultsKey.deletedReminderTaskTitlesByID, listName: listName)
     }
 
-    private func listScopedDefaultsKey(_ key: String) -> String {
-        "\(key).\(sanitizedReminderListName)"
+    private func storedManuallyExcludedReminderTaskTitlesByID(in listName: String) -> [String: String] {
+        defaults.dictionary(forKey: listScopedDefaultsKey(DefaultsKey.manuallyExcludedReminderTaskTitlesByID, listName: listName)) as? [String: String] ?? [:]
+    }
+
+    private func saveManuallyExcludedReminderTaskTitlesByID(_ taskTitlesByID: [String: String], in listName: String) {
+        saveTaskTitlesByID(taskTitlesByID, key: DefaultsKey.manuallyExcludedReminderTaskTitlesByID, listName: listName)
+    }
+
+    private func saveTaskTitlesByID(_ taskTitlesByID: [String: String], key: String, listName: String) {
+        let defaultsKey = listScopedDefaultsKey(key, listName: listName)
+        if taskTitlesByID.isEmpty {
+            defaults.removeObject(forKey: defaultsKey)
+        } else {
+            defaults.set(taskTitlesByID, forKey: defaultsKey)
+        }
+    }
+
+    private func listScopedDefaultsKey(_ key: String, listName: String) -> String {
+        "\(key).\(listName)"
+    }
+
+    private func excludedTaskTitle(for task: ObsidianTask) -> String? {
+        let listName = reminderListName(for: task)
+        if let title = storedManuallyExcludedReminderTaskTitlesByID(in: listName)[task.id] {
+            return title
+        }
+
+        return storedDeletedReminderTaskTitlesByID(in: listName)[task.id]
+    }
+
+    private func storedKnownReminderListNames() -> Set<String> {
+        Set((defaults.stringArray(forKey: DefaultsKey.knownReminderListNames) ?? []).map(sanitizedListName))
+    }
+
+    private func saveKnownReminderListNames(_ listNames: Set<String>) {
+        let cleanedListNames = Set(listNames.map(sanitizedListName))
+        if cleanedListNames.isEmpty {
+            defaults.removeObject(forKey: DefaultsKey.knownReminderListNames)
+        } else {
+            defaults.set(cleanedListNames.sorted(), forKey: DefaultsKey.knownReminderListNames)
+        }
     }
 
     private var sanitizedReminderListName: String {
-        let trimmed = reminderListName.trimmingCharacters(in: .whitespacesAndNewlines)
+        sanitizedListName(reminderListName)
+    }
+
+    private func sanitizedListName(_ listName: String) -> String {
+        let trimmed = listName.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? "Obsidian" : trimmed
+    }
+
+    private func saveTaskFileReminderListNames() {
+        let defaultListName = sanitizedReminderListName
+        let cleanedListNames = taskFileReminderListNamesByPath.compactMapValues { listName -> String? in
+            let sanitized = sanitizedListName(listName)
+            return sanitized == defaultListName ? nil : sanitized
+        }
+
+        taskFileReminderListNamesByPath = cleanedListNames
+        if cleanedListNames.isEmpty {
+            defaults.removeObject(forKey: DefaultsKey.taskFileReminderListNamesByPath)
+        } else {
+            defaults.set(cleanedListNames, forKey: DefaultsKey.taskFileReminderListNamesByPath)
+        }
     }
 
     private func restoreBookmarks() {
