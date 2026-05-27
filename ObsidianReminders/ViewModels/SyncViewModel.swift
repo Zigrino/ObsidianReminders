@@ -24,6 +24,8 @@ struct TaskFileSelection: Identifiable, Hashable {
 final class SyncViewModel: ObservableObject {
     @Published private(set) var dailyNotesFolderURL: URL?
     @Published private(set) var taskFileURLs: [URL] = []
+    @Published private var dailyNotesReminderListNameOverride: String?
+    @Published private var draftDailyNotesReminderListName: String?
     @Published private var taskFileReminderListNamesByPath: [String: String] = [:]
     @Published private var taskFileReminderListNameDraftsByPath: [String: String] = [:]
     @Published var reminderListName: String {
@@ -60,6 +62,7 @@ final class SyncViewModel: ObservableObject {
         static let dailyNotesFolderBookmark = "dailyNotesFolderBookmark"
         static let todoFileBookmark = "todoFileBookmark"
         static let taskFileBookmarks = "taskFileBookmarks"
+        static let dailyNotesReminderListName = "dailyNotesReminderListName"
         static let taskFileReminderListNamesByPath = "taskFileReminderListNamesByPath"
         static let reminderListName = "reminderListName"
         static let knownReminderListNames = "knownReminderListNames"
@@ -109,6 +112,7 @@ final class SyncViewModel: ObservableObject {
         self.isContinuousSyncEnabled = defaults.object(forKey: DefaultsKey.continuousSyncEnabled) as? Bool ?? true
         self.clearsOldDailyNotes = defaults.object(forKey: DefaultsKey.clearsOldDailyNotes) as? Bool ?? false
         self.hidesCompletedTasks = defaults.object(forKey: DefaultsKey.hidesCompletedTasks) as? Bool ?? false
+        self.dailyNotesReminderListNameOverride = defaults.string(forKey: DefaultsKey.dailyNotesReminderListName)
         self.taskFileReminderListNamesByPath = defaults.dictionary(forKey: DefaultsKey.taskFileReminderListNamesByPath) as? [String: String] ?? [:]
         restoreBookmarks()
         refreshRemindersStatus()
@@ -126,6 +130,26 @@ final class SyncViewModel: ObservableObject {
 
     var taskFilesLabel: String {
         taskFileURLs.isEmpty ? "No files selected" : "\(taskFileURLs.count) file\(taskFileURLs.count == 1 ? "" : "s") selected"
+    }
+
+    var hasDailyNotesFolderSelected: Bool {
+        dailyNotesFolderURL != nil
+    }
+
+    var dailyNotesReminderListName: String {
+        reminderListNameForDailyNotes()
+    }
+
+    var draftDailyNotesListName: String {
+        draftDailyNotesReminderListName ?? dailyNotesReminderListName
+    }
+
+    var hasPendingDailyNotesReminderListChange: Bool {
+        guard let draftDailyNotesReminderListName else {
+            return false
+        }
+
+        return draftDailyNotesReminderListName != dailyNotesReminderListName
     }
 
     var taskFileSelections: [TaskFileSelection] {
@@ -154,6 +178,10 @@ final class SyncViewModel: ObservableObject {
 
             return draftReminderListName != reminderListName(forTaskFile: url)
         }
+    }
+
+    var hasPendingReminderListChanges: Bool {
+        hasPendingDailyNotesReminderListChange || hasPendingTaskFileReminderListChanges
     }
 
     var canSync: Bool {
@@ -191,6 +219,7 @@ final class SyncViewModel: ObservableObject {
 
     func clearDailyNotesFolder() {
         defaults.removeObject(forKey: DefaultsKey.dailyNotesFolderBookmark)
+        draftDailyNotesReminderListName = nil
         dailyNotesFolderURL = nil
         scanNow()
         updateContinuousSyncStatus()
@@ -222,6 +251,14 @@ final class SyncViewModel: ObservableObject {
         updateContinuousSyncStatus()
     }
 
+    func setDraftDailyNotesReminderListName(_ listName: String) {
+        if listName == dailyNotesReminderListName {
+            draftDailyNotesReminderListName = nil
+        } else {
+            draftDailyNotesReminderListName = listName
+        }
+    }
+
     func setDraftReminderListName(_ listName: String, for selection: TaskFileSelection) {
         if listName == reminderListName(forTaskFile: selection.url) {
             taskFileReminderListNameDraftsByPath.removeValue(forKey: selection.id)
@@ -230,14 +267,28 @@ final class SyncViewModel: ObservableObject {
         }
     }
 
-    func applyTaskFileReminderListChanges() {
-        guard hasPendingTaskFileReminderListChanges else {
+    func applyReminderListChanges() {
+        guard hasPendingReminderListChanges else {
+            draftDailyNotesReminderListName = nil
             taskFileReminderListNameDraftsByPath = [:]
             return
         }
 
         let defaultListName = sanitizedReminderListName
         var changedEffectiveList = false
+
+        if let draftDailyNotesReminderListName {
+            let previousReminderListName = reminderListNameForDailyNotes()
+            let nextReminderListName = sanitizedListName(draftDailyNotesReminderListName)
+            changedEffectiveList = changedEffectiveList || nextReminderListName != previousReminderListName
+
+            if nextReminderListName == defaultListName {
+                dailyNotesReminderListNameOverride = nil
+            } else {
+                dailyNotesReminderListNameOverride = nextReminderListName
+            }
+            saveDailyNotesReminderListName()
+        }
 
         for taskFileURL in taskFileURLs {
             let path = taskFileURL.standardizedFileURL.path
@@ -256,10 +307,11 @@ final class SyncViewModel: ObservableObject {
             }
         }
 
+        draftDailyNotesReminderListName = nil
         taskFileReminderListNameDraftsByPath = [:]
         saveTaskFileReminderListNames()
         scanNow()
-        statusMessage = changedEffectiveList ? "Applied task file list changes." : "No task file list changes to apply."
+        statusMessage = changedEffectiveList ? "Applied reminder list changes." : "No reminder list changes to apply."
 
         if changedEffectiveList {
             kickContinuousSyncIfNeeded()
@@ -296,6 +348,17 @@ final class SyncViewModel: ObservableObject {
 
     func syncNow() async {
         await performSync(trigger: .manual)
+    }
+
+    func removeTaskFromView(_ task: ObsidianTask) {
+        let initialCount = tasks.count
+        tasks.removeAll { $0.id == task.id }
+
+        guard tasks.count < initialCount else { return }
+
+        lastSummary = nil
+        statusMessage = "Removed from view; it can reappear on the next scan or sync."
+        updateContinuousSyncStatus()
     }
 
     func syncStatusLabel(for task: ObsidianTask) -> String {
@@ -635,7 +698,7 @@ final class SyncViewModel: ObservableObject {
         var listNames: Set<String> = []
 
         if dailyNotesFolderURL != nil {
-            listNames.insert(sanitizedReminderListName)
+            listNames.insert(reminderListNameForDailyNotes())
         }
 
         for taskFileURL in taskFileURLs {
@@ -648,10 +711,18 @@ final class SyncViewModel: ObservableObject {
     private func reminderListName(for task: ObsidianTask) -> String {
         switch task.source {
         case .dailyNote:
-            return sanitizedReminderListName
+            return reminderListNameForDailyNotes()
         case .todoFile:
             return reminderListName(forTaskFile: task.fileURL)
         }
+    }
+
+    private func reminderListNameForDailyNotes() -> String {
+        guard let dailyNotesReminderListNameOverride else {
+            return sanitizedReminderListName
+        }
+
+        return sanitizedListName(dailyNotesReminderListNameOverride)
     }
 
     private func reminderListName(forTaskFile url: URL) -> String {
@@ -842,6 +913,18 @@ final class SyncViewModel: ObservableObject {
     private func sanitizedListName(_ listName: String) -> String {
         let trimmed = listName.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? "Obsidian" : trimmed
+    }
+
+    private func saveDailyNotesReminderListName() {
+        let defaultListName = sanitizedReminderListName
+        guard let listName = dailyNotesReminderListNameOverride.map(sanitizedListName), listName != defaultListName else {
+            dailyNotesReminderListNameOverride = nil
+            defaults.removeObject(forKey: DefaultsKey.dailyNotesReminderListName)
+            return
+        }
+
+        dailyNotesReminderListNameOverride = listName
+        defaults.set(listName, forKey: DefaultsKey.dailyNotesReminderListName)
     }
 
     private func saveTaskFileReminderListNames() {

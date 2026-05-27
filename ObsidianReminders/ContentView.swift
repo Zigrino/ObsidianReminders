@@ -47,6 +47,19 @@ struct ContentView: View {
 
                 TableColumn("Due", value: \.dueDateLabel)
                     .width(120)
+
+                TableColumn("") { task in
+                    Button {
+                        viewModel.removeTaskFromView(task)
+                    } label: {
+                        Image(systemName: "xmark.circle")
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+                    .help("Remove from this view until the next scan or sync")
+                    .disabled(viewModel.isWorking)
+                }
+                .width(44)
             }
             .overlay {
                 if viewModel.visibleTasks.isEmpty {
@@ -69,13 +82,7 @@ struct ContentView: View {
     private var toolbar: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top, spacing: 12) {
-                sourcePicker(
-                    title: "Daily Notes",
-                    systemImage: "folder",
-                    selection: viewModel.dailyNotesFolderLabel,
-                    chooseAction: chooseDailyNotesFolder,
-                    clearAction: viewModel.clearDailyNotesFolder
-                )
+                dailyNotesPicker
 
                 taskFilesPicker
             }
@@ -101,6 +108,14 @@ struct ContentView: View {
                 .frame(height: 22)
 
             defaultListField
+
+            Button {
+                viewModel.applyReminderListChanges()
+            } label: {
+                Label("Apply Lists", systemImage: "checkmark.circle")
+            }
+            .disabled(!viewModel.hasPendingReminderListChanges || viewModel.isWorking)
+            .help("Apply Daily Notes and task-file list changes to sync")
 
             Toggle(isOn: $viewModel.isContinuousSyncEnabled) {
                 Label("Auto", systemImage: "clock.arrow.2.circlepath")
@@ -158,7 +173,59 @@ struct ContentView: View {
         }
         .frame(width: 180, alignment: .leading)
         .fixedSize(horizontal: true, vertical: true)
-        .help("Default Reminders list for daily notes and task files without an override")
+        .help("Default Reminders list for sources without an override")
+    }
+
+    private var dailyNotesPicker: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Button(action: chooseDailyNotesFolder) {
+                    Label("Daily Notes", systemImage: "folder")
+                }
+
+                Button(action: viewModel.clearDailyNotesFolder) {
+                    Image(systemName: "xmark.circle")
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .help("Remove daily notes folder")
+            }
+
+            Text(viewModel.dailyNotesFolderLabel)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            if viewModel.hasDailyNotesFolderSelected {
+                HStack(spacing: 6) {
+                    Text("List")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    TextField(
+                        "List",
+                        text: Binding(
+                            get: {
+                                viewModel.draftDailyNotesListName
+                            },
+                            set: { newValue in
+                                viewModel.setDraftDailyNotesReminderListName(newValue)
+                            }
+                        )
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+                    .frame(width: 150)
+                    .help("Reminder list for Daily Notes; changes apply after pressing Apply Lists")
+
+                    pendingListIndicator(viewModel.hasPendingDailyNotesReminderListChange)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     private var statusBar: some View {
@@ -210,17 +277,6 @@ struct ContentView: View {
                 Text(viewModel.taskFilesLabel)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-
-                if !viewModel.taskFileSelections.isEmpty {
-                    Button {
-                        viewModel.applyTaskFileReminderListChanges()
-                    } label: {
-                        Label("Apply Lists", systemImage: "checkmark.circle")
-                    }
-                    .buttonStyle(.borderless)
-                    .disabled(!viewModel.hasPendingTaskFileReminderListChanges || viewModel.isWorking)
-                    .help("Apply file list changes to sync")
-                }
             }
 
             if viewModel.taskFileSelections.isEmpty {
@@ -262,15 +318,7 @@ struct ContentView: View {
                             .frame(width: 150)
                             .help("Reminder list for this task file; changes apply after pressing Apply Lists")
 
-                            if selection.hasPendingReminderListChange {
-                                Image(systemName: "circle.fill")
-                                    .font(.system(size: 7, weight: .semibold))
-                                    .foregroundStyle(.orange)
-                                    .help("Pending list change")
-                            } else {
-                                Color.clear
-                                    .frame(width: 7, height: 7)
-                            }
+                            pendingListIndicator(selection.hasPendingReminderListChange)
 
                             Button {
                                 viewModel.removeTaskFile(selection)
@@ -290,35 +338,17 @@ struct ContentView: View {
         .fixedSize(horizontal: false, vertical: true)
     }
 
-    private func sourcePicker(
-        title: String,
-        systemImage: String,
-        selection: String,
-        chooseAction: @escaping () -> Void,
-        clearAction: @escaping () -> Void
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                Button(action: chooseAction) {
-                    Label(title, systemImage: systemImage)
-                }
-
-                Button(action: clearAction) {
-                    Image(systemName: "xmark.circle")
-                }
-                .buttonStyle(.borderless)
-                .foregroundStyle(.secondary)
-            }
-
-            Text(selection)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .frame(maxWidth: .infinity, alignment: .leading)
+    @ViewBuilder
+    private func pendingListIndicator(_ isPending: Bool) -> some View {
+        if isPending {
+            Image(systemName: "circle.fill")
+                .font(.system(size: 7, weight: .semibold))
+                .foregroundStyle(.orange)
+                .help("Pending list change")
+        } else {
+            Color.clear
+                .frame(width: 7, height: 7)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .fixedSize(horizontal: false, vertical: true)
     }
 
     private func chooseDailyNotesFolder() {
