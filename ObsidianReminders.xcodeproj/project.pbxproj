@@ -194,6 +194,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readwrite;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_LSUIElement = YES;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				INFOPLIST_KEY_NSRemindersFullAccessUsageDescription = "Sync Obsidian tasks with Reminders.";
 				INFOPLIST_KEY_NSRemindersUsageDescription = "Sync Obsidian tasks with Reminders.";
@@ -346,6 +347,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readwrite;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_LSUIElement = YES;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				INFOPLIST_KEY_NSRemindersFullAccessUsageDescription = "Sync Obsidian tasks with Reminders.";
 				INFOPLIST_KEY_NSRemindersUsageDescription = "Sync Obsidian tasks with Reminders.";
@@ -380,6 +382,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readwrite;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_LSUIElement = YES;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				INFOPLIST_KEY_NSRemindersFullAccessUsageDescription = "Sync Obsidian tasks with Reminders.";
 				INFOPLIST_KEY_NSRemindersUsageDescription = "Sync Obsidian tasks with Reminders.";
